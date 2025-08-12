@@ -30,10 +30,12 @@ except:
     pass
 
 # Constants for large file handling
-CHUNK_SIZE = 50000  # Process 50K rows at a time for CSV
-PARQUET_BATCH_SIZE = 100000  # Read 100K rows at a time for Parquet
-MAX_MEMORY_PERCENT = 80  # Alert if memory usage exceeds this
-PROGRESS_UPDATE_INTERVAL = 10000  # Update progress every N rows
+CHUNK_SIZE = 10000  # Reduced from 50000 for Streamlit Cloud stability
+PARQUET_BATCH_SIZE = 25000  # Reduced from 100000 for Streamlit Cloud
+MAX_MEMORY_PERCENT = 60  # Reduced from 80 for Streamlit Cloud
+PROGRESS_UPDATE_INTERVAL = 5000  # Update progress every N rows
+MAX_FILE_SIZE_CLOUD = 20 * 1024 * 1024  # 20MB limit for CSV on cloud
+MAX_PROCESSING_TIME = 300  # 5 minute timeout
 
 # Utility Functions
 def get_memory_usage():
@@ -84,7 +86,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         lower_col = col.lower()
         if lower_col in ['name']:
             column_mapping[col] = 'Name'
-        elif lower_col in ['contentlength', 'content_length', 'content-length', 'size']:
+        elif lower_col in ['Content-Length', 'content_length', 'content-length', 'size']:
             column_mapping[col] = 'Content-Length'
         elif lower_col in ['lastmodified', 'last_modified', 'last-modified']:
             column_mapping[col] = 'LastModified'
@@ -157,7 +159,7 @@ def process_local_parquet_in_batches(filename: str, max_depth: int, include_root
         needed_cols = []
         for col in available_cols:
             lower_col = col.lower()
-            if lower_col in ['name', 'contentlength', 'content_length', 'content-length', 'size']:
+            if lower_col in ['name', 'Content-Length', 'content_length', 'content-length', 'size']:
                 needed_cols.append(col)
         
         processed_rows = 0
@@ -289,7 +291,7 @@ def process_parquet_in_batches(uploaded_file, max_depth: int, include_root: bool
         needed_cols = []
         for col in available_cols:
             lower_col = col.lower()
-            if lower_col in ['name', 'contentlength', 'content_length', 'content-length', 'size']:
+            if lower_col in ['name', 'Content-Length', 'content_length', 'content-length', 'size']:
                 needed_cols.append(col)
         
         processed_rows = 0
@@ -770,6 +772,11 @@ def main():
         st.warning("""
         ### 📁 File Size Limit Configuration
         
+        **For Streamlit Cloud deployment:**
+        - **CSV files**: Recommended maximum 20MB for stability
+        - **Parquet files**: Can handle larger files (up to 200MB)
+        - **Very large files**: Use the local file option with the desktop app
+        
         **If you see a 200MB upload limit:**
         
         1. **Create** a `.streamlit/config.toml` file in your project folder
@@ -782,7 +789,7 @@ def main():
         
         **Alternative for very large files:**
         - Place your file in the same directory as `app.py`
-        - The app can be modified to read files directly from disk
+        - Run the app locally for best performance with 1GB+ files
         """)
         
         st.markdown("""
@@ -799,7 +806,7 @@ def main():
         💡 **Performance Tips for Large Files (1GB+)**:
         - **Parquet format is strongly recommended** (5-10x faster processing)
         - CSV files will be processed in chunks but may take longer
-        - Ensure you have sufficient RAM (recommended: 4GB+ for 1GB files)
+        - For files >20MB, consider running locally for best performance
         - Close other memory-intensive applications before processing
         """)
         return
@@ -817,11 +824,44 @@ def main():
         # Warning for large CSV files
         if file_info['type'] == 'csv' and file_info['size_bytes'] > 100 * 1024 * 1024:  # 100MB
             st.sidebar.warning("⚠️ Large CSV file detected. Consider converting to Parquet for better performance.")
+        
+        # Critical warning for files that may crash Streamlit Cloud
+        if file_info['type'] == 'csv' and file_info['size_bytes'] > MAX_FILE_SIZE_CLOUD:
+            st.sidebar.error(f"""
+            🚨 **File Too Large for Streamlit Cloud**
+            - Your CSV file: {file_info['size_readable']}
+            - Cloud limit: {bytes_to_readable(MAX_FILE_SIZE_CLOUD)}
+            - **Recommendation**: Use Parquet format or run locally
+            """)
+            
+        # Show processing estimate
+        if file_info['type'] == 'csv':
+            est_time = min(file_info['size_bytes'] // (1024 * 1024) * 2, 300)  # ~2 sec per MB, max 5 min
+            st.sidebar.info(f"⏱️ Estimated processing time: ~{est_time} seconds")
+        
+        # Additional warnings for Streamlit Cloud
+        if file_info['type'] == 'csv' and file_info['size_bytes'] > 10 * 1024 * 1024:  # 10MB+
+            st.sidebar.warning("""
+            🌐 **Streamlit Cloud Notice:**
+            - Large CSV files may timeout or crash the app
+            - Consider using Parquet format for better stability
+            - Processing will use very small chunks
+            - For files >20MB, local execution is recommended
+            """)
     
         # Processing controls
         st.sidebar.header("⚙️ Processing")
         
-        if st.sidebar.button("🚀 Process File", type="primary"):
+        # Disable processing for files that are too large for cloud
+        disable_processing = (file_info['type'] == 'csv' and 
+                            file_info['size_bytes'] > MAX_FILE_SIZE_CLOUD and 
+                            file_source != "local")
+        
+        if st.sidebar.button("🚀 Process File", type="primary", disabled=disable_processing):
+            if disable_processing:
+                st.error("❌ File too large for Streamlit Cloud. Please use a smaller file or run locally.")
+                return
+                
             # Clear any previous results
             if 'agg_df' in st.session_state:
                 del st.session_state['agg_df']
@@ -833,6 +873,27 @@ def main():
             try:
                 with status_placeholder:
                     st.info(f"🔄 Processing {file_info['size_readable']} {file_info['type'].upper()} file...")
+                
+                # Add timeout check
+                def check_timeout():
+                    if time.time() - start_time > MAX_PROCESSING_TIME:
+                        raise TimeoutError(f"Processing timeout after {MAX_PROCESSING_TIME} seconds")
+                
+                # Additional validation for CSV files
+                if file_info['type'] == 'csv' and file_source == "upload":
+                    # Quick validation of CSV structure
+                    try:
+                        uploaded_file.seek(0)
+                        sample_df = pd.read_csv(uploaded_file, nrows=5)
+                        uploaded_file.seek(0)
+                        
+                        # Check if it can be normalized
+                        normalized_sample = normalize_columns(sample_df.copy())
+                        
+                        st.info(f"✅ CSV validation passed. Columns found: {list(sample_df.columns)}")
+                    except Exception as validation_error:
+                        st.error(f"❌ CSV validation failed: {str(validation_error)}")
+                        return
                 
                 # Process file based on source and type
                 if file_source == "local":
@@ -854,6 +915,9 @@ def main():
                             uploaded_file, max_depth, include_root, progress_placeholder
                         )
                 
+                # Check timeout after processing
+                check_timeout()
+                
                 # Convert to DataFrame
                 agg_df = convert_aggregated_to_dataframe(aggregated_data)
                 
@@ -868,9 +932,22 @@ def main():
                 del aggregated_data
                 gc.collect()
                 
+            except TimeoutError as te:
+                progress_placeholder.empty()
+                status_placeholder.error(f"⏰ Processing timeout: {str(te)}")
+                st.info("💡 **Timeout Suggestions:**\n- Try a smaller file\n- Use Parquet format\n- Run the app locally for large files")
+                
             except Exception as e:
                 progress_placeholder.empty()
                 status_placeholder.error(f"❌ Error processing file: {str(e)}")
+                
+                # Provide helpful suggestions based on error
+                if "memory" in str(e).lower():
+                    st.info("💡 **Memory Issue Suggestions:**\n- Try a smaller file (recommended: <20MB for CSV)\n- Use Parquet format instead\n- Run the app locally\n- Reduce max folder depth")
+                elif "parsing" in str(e).lower() or "csv" in str(e).lower():
+                    st.info("💡 **CSV Issue Suggestions:**\n- Check file encoding (should be UTF-8)\n- Verify CSV has proper headers\n- Try opening in Excel to check format")
+                elif "timeout" in str(e).lower():
+                    st.info("💡 **Timeout Suggestions:**\n- File is too large for Streamlit Cloud\n- Use Parquet format for better performance\n- Run the app locally")
                 return
     else:
         st.info("👆 Please upload a file or select a local file to analyze")
