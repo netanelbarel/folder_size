@@ -29,12 +29,12 @@ try:
 except:
     pass
 
-# Constants for large file handling
-CHUNK_SIZE = 10000  # Reduced from 50000 for Streamlit Cloud stability
-PARQUET_BATCH_SIZE = 25000  # Reduced from 100000 for Streamlit Cloud
-MAX_MEMORY_PERCENT = 60  # Reduced from 80 for Streamlit Cloud
-PROGRESS_UPDATE_INTERVAL = 5000  # Update progress every N rows
-MAX_FILE_SIZE_CLOUD = 20 * 1024 * 1024  # 20MB limit for CSV on cloud
+# Constants for large file handling - Ultra-conservative for Streamlit Cloud
+CHUNK_SIZE = 2500  # Very small chunks for stability
+PARQUET_BATCH_SIZE = 5000  # Very small batches
+MAX_MEMORY_PERCENT = 50  # Very conservative memory limit
+PROGRESS_UPDATE_INTERVAL = 1000  # More frequent updates
+MAX_FILE_SIZE_CLOUD = 5 * 1024 * 1024  # 5MB limit for CSV on cloud
 MAX_PROCESSING_TIME = 300  # 5 minute timeout
 
 # Utility Functions
@@ -831,23 +831,29 @@ def main():
             🚨 **File Too Large for Streamlit Cloud**
             - Your CSV file: {file_info['size_readable']}
             - Cloud limit: {bytes_to_readable(MAX_FILE_SIZE_CLOUD)}
-            - **Recommendation**: Use Parquet format or run locally
+            - **Action Required**: Use a smaller file or run locally
             """)
             
         # Show processing estimate
         if file_info['type'] == 'csv':
-            est_time = min(file_info['size_bytes'] // (1024 * 1024) * 2, 300)  # ~2 sec per MB, max 5 min
+            est_time = min(file_info['size_bytes'] // (1024 * 1024) * 5, 120)  # ~5 sec per MB, max 2 min
             st.sidebar.info(f"⏱️ Estimated processing time: ~{est_time} seconds")
         
         # Additional warnings for Streamlit Cloud
-        if file_info['type'] == 'csv' and file_info['size_bytes'] > 10 * 1024 * 1024:  # 10MB+
-            st.sidebar.warning("""
-            🌐 **Streamlit Cloud Notice:**
-            - Large CSV files may timeout or crash the app
-            - Consider using Parquet format for better stability
-            - Processing will use very small chunks
-            - For files >20MB, local execution is recommended
+        if file_info['type'] == 'csv' and file_info['size_bytes'] > 2 * 1024 * 1024:  # 2MB+
+            st.sidebar.warning(f"""
+            🌐 **Streamlit Cloud Stability Notice:**
+            - CSV files >2MB may cause app crashes
+            - Ultra-small chunks will be used ({CHUNK_SIZE} rows)
+            - For large files, **local execution strongly recommended**
             """)
+        
+        # Show health status
+        memory_usage = get_memory_usage()
+        if memory_usage > 30:
+            st.sidebar.warning(f"⚠️ Current memory usage: {memory_usage:.1f}%")
+        else:
+            st.sidebar.success(f"✅ Memory usage: {memory_usage:.1f}%")
     
         # Processing controls
         st.sidebar.header("⚙️ Processing")
